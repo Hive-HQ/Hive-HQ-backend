@@ -1,0 +1,5 @@
+/venv
+
+# dependencies
+/yolov5
+/deep_sort_pytorch

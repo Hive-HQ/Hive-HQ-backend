@@ -248,7 +248,7 @@ def start_detection(source, control_obj, out="inference/output", device="0"):
                         cls = output[5]
 
                         c = int(cls)  # integer class
-                        label = f"{id} {names[c]} {conf:.2f}"
+                        label = f"{id}"
 
                         box_left = output[0]
                         box_top = output[1]
@@ -409,7 +409,7 @@ def generate_heatmap():
                     for px, py in worker.points:
                         total_people += 1
 
-                        if py <= 480-1 and px <= 640-1 and frame%10 == 0: 
+                        if py < 480 and px < 640 and py > 0 and px > 0 and frame%10 == 0: 
                             # print(py, len(hm_grid), py//grid_size)
                             # print(px, len(hm_grid[0]), px//grid_size)
                             hm_grid[py//grid_size][px//grid_size]+=1

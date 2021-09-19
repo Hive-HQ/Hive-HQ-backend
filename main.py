@@ -24,14 +24,18 @@ from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 import threading
 import urllib
+import copy
+import math
+import traceback
 
 server = Flask(__name__)
 CORS(server)
 ai_workers = {}
 floorplan_image = None
 heatmap_img = None
-total_people = 0
-total_dangerous = 0
+stats = {
+    "total_people": 0
+}
 
 # Hack way to allow multiple threads to talk to eachother lol
 # GIL for the win!!!
@@ -274,34 +278,25 @@ def start_detection(source, control_obj, out="inference/output", device="0"):
                         cv2.ellipse(
                             annotator.im,
                             (center_point_x, center_point_y),
-                            (box_w * 2, (2 * 2 * box_w) // (3)),
+                            (max(1, box_h), max(1, math.floor(0.75*box_h))),
                             0,
                             0,
                             360,
                             (0, 165, 255),
                             thickness=2,
                         )
+
+                        annotator.box_label(bboxes, label, color=colors(c, True))
 
                         # Plotter
 
-                        cv2.rectangle(
-                            plotter,
-                            (center_point_x + 5, center_point_y + 5),
-                            (center_point_x - 5, center_point_y - 5),
-                            color=(0, 0, 0),
-                            thickness=2,
-                        )
-
-                        cv2.ellipse(
-                            plotter,
-                            (center_point_x, center_point_x),
-                            (10, 10),
-                            0,
-                            0,
-                            360,
-                            (0, 165, 255),
-                            thickness=2,
-                        )
+                        # cv2.rectangle(
+                        #     plotter,
+                        #     (center_point_x + 5, center_point_y + 5),
+                        #     (center_point_x - 5, center_point_y - 5),
+                        #     color=(0, 0, 0),
+                        #     thickness=2,
+                        # )
 
                     # print(coordinates)
 
@@ -321,9 +316,20 @@ def start_detection(source, control_obj, out="inference/output", device="0"):
                     for transformed_x, transformed_y in transformed_coordinates:
                         cv2.rectangle(
                             plotter,
-                            (transformed_x + 3, transformed_y + 3),
-                            (transformed_x - 3, transformed_y - 3),
-                            color=(255, 255, 0),
+                            (transformed_x + 5, transformed_y + 5),
+                            (transformed_x - 5, transformed_y - 5),
+                            color=(0, 0, 0),
+                            thickness=2,
+                        )
+
+                        cv2.ellipse(
+                            plotter,
+                            (transformed_x, transformed_y),
+                            (10, 10),
+                            0,
+                            0,
+                            360,
+                            (0, 165, 255),
                             thickness=2,
                         )
 
@@ -331,7 +337,7 @@ def start_detection(source, control_obj, out="inference/output", device="0"):
                 deepsort.increment_ages()
 
             # Print time (inference + NMS)
-            print("[CAMERA %d] %sDone Frame. (%.3fs)" % (control_obj.id, s, t2 - t1))
+            # print("[CAMERA %d] %sDone Frame. (%.3fs)" % (control_obj.id, s, t2 - t1))
 
             # Stream results
             im0 = annotator.result()
@@ -349,8 +355,24 @@ def start_detection(source, control_obj, out="inference/output", device="0"):
 
 
 def generate_heatmap():
+    hm_hist = []
+    sample_time = 20
+    frame = 0
     while True:
-        try:
+        frame += 1
+        try:     
+            # Create heatmap grid
+            grid_size = 40
+            total_grids = (480//grid_size)*(640//grid_size)
+            hm_grid = []
+            na_risk_zones = []
+            no_risk_zones = []
+            low_risk_zones = []
+            medium_risk_zones = []
+            high_risk_zones = []
+            for y in range(480//grid_size):
+                hm_grid.append([0] * (640//grid_size))
+
             time.sleep(0.05)
             plot_width = 640
             plot_height = 480
@@ -361,8 +383,7 @@ def generate_heatmap():
             else:
                 plotter = cv2.resize(floorplan_image, dsize=(plot_width, plot_height), interpolation=cv2.INTER_CUBIC)
 
-            temp_total_people = 0
-            temp_total_dangerous = 0
+            total_people = 0
             scanned_coords = []
             for worker in ai_workers.values():
                 if worker.online:
@@ -386,7 +407,13 @@ def generate_heatmap():
                     )
 
                     for px, py in worker.points:
-                        temp_total_people += 1
+                        total_people += 1
+
+                        if py <= 480-1 and px <= 640-1 and frame%10 == 0: 
+                            # print(py, len(hm_grid), py//grid_size)
+                            # print(px, len(hm_grid[0]), px//grid_size)
+                            hm_grid[py//grid_size][px//grid_size]+=1
+
                         cv2.rectangle(
                             plotter,
                             (px + 5, py + 5),
@@ -406,12 +433,50 @@ def generate_heatmap():
                             thickness=2,
                         )
 
+            hm_hist.append(copy.deepcopy(hm_grid))
+            if len(hm_hist) > 50:
+                hm_hist.pop(0)
+
+            heatmap_overlay = np.zeros_like(plotter, np.uint8)
+
+            for hm_y in range(len(hm_grid)):
+                for hm_x in range(len(hm_grid[hm_y])):
+                    n_people = sum([grid[hm_y][hm_x] for grid in hm_hist])
+                    grid_color = (0, 0, 0)
+                    if n_people == 0:
+                        grid_color = (245, 165, 66)
+                        na_risk_zones.append((grid_size*hm_x+(grid_size//2), grid_size*hm_y+(grid_size//2)))
+                    elif n_people <= math.floor(sample_time*0.3):
+                        grid_color = (255, 255, 255)
+                        no_risk_zones.append((grid_size*hm_x+(grid_size//2), grid_size*hm_y+(grid_size//2)))
+                    elif n_people <= math.floor(sample_time*0.6):
+                        grid_color = (127, 127, 255)
+                        low_risk_zones.append((grid_size*hm_x+(grid_size//2), grid_size*hm_y+(grid_size//2)))
+                    elif n_people <= math.floor(sample_time*0.9):
+                        grid_color = (0, 0, 255)
+                        medium_risk_zones.append((grid_size*hm_x+(grid_size//2), grid_size*hm_y+(grid_size//2)))
+                    else:
+                        grid_color = (0, 0, 139)
+                        high_risk_zones.append((grid_size*hm_x+(grid_size//2), grid_size*hm_y+(grid_size//2)))
+
+                    cv2.rectangle(heatmap_overlay, (grid_size*hm_x, grid_size*hm_y), (grid_size*hm_x+grid_size, grid_size*hm_y+grid_size), grid_color, cv2.FILLED)
+
             global heatmap_img
-            global total_people
-            heatmap_img = plotter
-            total_people = temp_total_people
+            global stats
+
+            # Render Heatmap
+            alpha = 0.5
+            heatmap_img = cv2.addWeighted(plotter, alpha, heatmap_overlay, 1 - alpha, 0)
+
+            # Render Overlay Elements
+            for x, y in high_risk_zones:
+                cv2.putText(heatmap_img, "X High Risk Area!", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2)
+
+            # Calculate Stats
+            stats["total_people"] = total_people
 
         except Exception as e:
+            traceback.print_exc()
             print(e)
             time.sleep(1)
                 
@@ -547,16 +612,18 @@ def set_floorplan():
 
 @server.route("/camera/<worker_id>/set_in_bounds", methods=["POST"], strict_slashes=False)
 def set_in_bounds(worker_id):
+    print("HERE")
     json_data = request.get_json(force=True)
+    print(json_data)
     try:
-        p_x1 = int(json_data["p_x1"])
-        p_y1 = int(json_data["p_y1"])
-        p_x2 = int(json_data["p_x2"])
-        p_y2 = int(json_data["p_y2"])
-        p_x3 = int(json_data["p_x3"])
-        p_y3 = int(json_data["p_y3"])
-        p_x4 = int(json_data["p_x4"])
-        p_y4 = int(json_data["p_y4"])
+        x1 = int(json_data["x1"])
+        y1 = int(json_data["y1"])
+        x2 = int(json_data["x2"])
+        y2 = int(json_data["y2"])
+        x3 = int(json_data["x3"])
+        y3 = int(json_data["y3"])
+        x4 = int(json_data["x4"])
+        y4 = int(json_data["y4"])
     except KeyError:
         return "Missing Arguments", 400
 
@@ -566,14 +633,14 @@ def set_in_bounds(worker_id):
     elif ai_workers[worker_id] is None:
         return "Camera Offline", 400
 
-    ai_workers[worker_id].p_x1 = p_x1
-    ai_workers[worker_id].p_y1 = p_y1
-    ai_workers[worker_id].p_x2 = p_x2
-    ai_workers[worker_id].p_y2 = p_y2
-    ai_workers[worker_id].p_x3 = p_x3
-    ai_workers[worker_id].p_y3 = p_y3
-    ai_workers[worker_id].p_x4 = p_x4
-    ai_workers[worker_id].p_y4 = p_y4
+    ai_workers[worker_id].p_x1 = x1
+    ai_workers[worker_id].p_y1 = y1
+    ai_workers[worker_id].p_x2 = x2
+    ai_workers[worker_id].p_y2 = y2
+    ai_workers[worker_id].p_x3 = x3
+    ai_workers[worker_id].p_y3 = y3
+    ai_workers[worker_id].p_x4 = x4
+    ai_workers[worker_id].p_y4 = y4
 
     return "ok"
 
@@ -582,14 +649,14 @@ def set_in_bounds(worker_id):
 def set_out_bounds(worker_id):
     json_data = request.get_json(force=True)
     try:
-        o_x1 = int(json_data["o_x1"])
-        o_y1 = int(json_data["o_y1"])
-        o_x2 = int(json_data["o_x2"])
-        o_y2 = int(json_data["o_y2"])
-        o_x3 = int(json_data["o_x3"])
-        o_y3 = int(json_data["o_y3"])
-        o_x4 = int(json_data["o_x4"])
-        o_y4 = int(json_data["o_y4"])
+        x1 = int(json_data["x1"])
+        y1 = int(json_data["y1"])
+        x2 = int(json_data["x2"])
+        y2 = int(json_data["y2"])
+        x3 = int(json_data["x3"])
+        y3 = int(json_data["y3"])
+        x4 = int(json_data["x4"])
+        y4 = int(json_data["y4"])
     except KeyError:
         return "Missing Arguments", 400
 
@@ -599,14 +666,14 @@ def set_out_bounds(worker_id):
     elif ai_workers[worker_id] is None:
         return "Camera Offline", 400
 
-    ai_workers[worker_id].o_x1 = o_x1
-    ai_workers[worker_id].o_y1 = o_y1
-    ai_workers[worker_id].o_x2 = o_x2
-    ai_workers[worker_id].o_y2 = o_y2
-    ai_workers[worker_id].o_x3 = o_x3
-    ai_workers[worker_id].o_y3 = o_y3
-    ai_workers[worker_id].o_x4 = o_x4
-    ai_workers[worker_id].o_y4 = o_y4
+    ai_workers[worker_id].o_x1 = x1
+    ai_workers[worker_id].o_y1 = y1
+    ai_workers[worker_id].o_x2 = x2
+    ai_workers[worker_id].o_y2 = y2
+    ai_workers[worker_id].o_x3 = x3
+    ai_workers[worker_id].o_y3 = y3
+    ai_workers[worker_id].o_x4 = x4
+    ai_workers[worker_id].o_y4 = y4
 
     return "ok"
 
@@ -621,24 +688,24 @@ def get_bounds(worker_id):
 
     return jsonify({
         "in": {
-            "p_x1": ai_workers[worker_id].p_x1,
-            "p_y1": ai_workers[worker_id].p_y1,
-            "p_x2": ai_workers[worker_id].p_x2,
-            "p_y2": ai_workers[worker_id].p_y2,
-            "p_x3": ai_workers[worker_id].p_x3,
-            "p_y3": ai_workers[worker_id].p_y3,
-            "p_x4": ai_workers[worker_id].p_x4,
-            "p_y4": ai_workers[worker_id].p_y4
+            "x1": ai_workers[worker_id].p_x1,
+            "y1": ai_workers[worker_id].p_y1,
+            "x2": ai_workers[worker_id].p_x2,
+            "y2": ai_workers[worker_id].p_y2,
+            "x3": ai_workers[worker_id].p_x3,
+            "y3": ai_workers[worker_id].p_y3,
+            "x4": ai_workers[worker_id].p_x4,
+            "y4": ai_workers[worker_id].p_y4
         },
         "out": {
-            "o_x1": ai_workers[worker_id].o_x1,
-            "o_y1": ai_workers[worker_id].o_y1,
-            "o_x2": ai_workers[worker_id].o_x2,
-            "o_y2": ai_workers[worker_id].o_y2,
-            "o_x3": ai_workers[worker_id].o_x3,
-            "o_y3": ai_workers[worker_id].o_y3,
-            "o_x4": ai_workers[worker_id].o_x4,
-            "o_y4": ai_workers[worker_id].o_y4
+            "x1": ai_workers[worker_id].o_x1,
+            "y1": ai_workers[worker_id].o_y1,
+            "x2": ai_workers[worker_id].o_x2,
+            "y2": ai_workers[worker_id].o_y2,
+            "x3": ai_workers[worker_id].o_x3,
+            "y3": ai_workers[worker_id].o_y3,
+            "x4": ai_workers[worker_id].o_x4,
+            "y4": ai_workers[worker_id].o_y4
         }
     })
 
@@ -669,6 +736,23 @@ if __name__ == "__main__":
     heatmap_generation_thread = threading.Thread(target=generate_heatmap)
     heatmap_generation_thread.setDaemon(True)
     heatmap_generation_thread.start()
+
+    #################
+    #TEMP#  
+    worker_id = len(ai_workers)
+    new_control_obj = AIControlObj(worker_id)
+    new_ai_thread = threading.Thread(
+        target=start_detection,
+        args=(
+            "http://198.84.180.114:5510/camera",
+            new_control_obj,
+        ),
+    )
+    new_ai_thread.daemon = True
+    new_ai_thread.start()
+
+    ai_workers[worker_id] = new_control_obj
+    #################
 
     server.run(host=args.ip, port=args.port)
 

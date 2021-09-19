@@ -23,11 +23,15 @@ import torch.backends.cudnn as cudnn
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 import threading
+import urllib
 
 server = Flask(__name__)
 CORS(server)
 ai_workers = {}
 floorplan_image = None
+heatmap_img = None
+total_people = 0
+total_dangerous = 0
 
 # Hack way to allow multiple threads to talk to eachother lol
 # GIL for the win!!!
@@ -37,6 +41,8 @@ class AIControlObj:
         self.final_img = None  # Final Output Frame
         self.final_plot_img = None  # Final Plot Frame
         self.online = True
+
+        self.points = []
 
         self.p_x1 = 0
         self.p_y1 = 0
@@ -147,10 +153,12 @@ def start_detection(source, control_obj, out="inference/output", device="0"):
             annotator = Annotator(im0, line_width=2, pil=not ascii)
             plot_width = 640
             plot_height = 480
-            plotter = np.zeros((plot_height, plot_width, 3), np.uint8)
             if floorplan_image is None:
+                plotter = np.zeros((plot_height, plot_width, 3), np.uint8)
                 plotter[:, 0:plot_width] = (250, 255, 255)
-                cv2.putText(plotter, "Please Upload A Floorplan", (100, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0,0,0))
+                cv2.putText(plotter, "Please Upload A Floorplan!", (20, 480-20), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 1)
+            else:
+                plotter = cv2.resize(floorplan_image, dsize=(plot_width, plot_height), interpolation=cv2.INTER_CUBIC)
 
             cv2.polylines(
                 annotator.im,
@@ -284,6 +292,17 @@ def start_detection(source, control_obj, out="inference/output", device="0"):
                             thickness=2,
                         )
 
+                        cv2.ellipse(
+                            plotter,
+                            (center_point_x, center_point_x),
+                            (10, 10),
+                            0,
+                            0,
+                            360,
+                            (0, 165, 255),
+                            thickness=2,
+                        )
+
                     # print(coordinates)
 
                     transformed_coordinates = cv2.perspectiveTransform(
@@ -296,6 +315,8 @@ def start_detection(source, control_obj, out="inference/output", device="0"):
                     ]
 
                     # print(transformed_coordinates)
+
+                    control_obj.points = transformed_coordinates
 
                     for transformed_x, transformed_y in transformed_coordinates:
                         cv2.rectangle(
@@ -325,6 +346,75 @@ def start_detection(source, control_obj, out="inference/output", device="0"):
             if not control_obj.online:
                 print("WORKER THREAD KILLED. (%.3fs)" % (time.time() - t0))
                 return None
+
+
+def generate_heatmap():
+    while True:
+        try:
+            time.sleep(0.05)
+            plot_width = 640
+            plot_height = 480
+            if floorplan_image is None:
+                plotter = np.zeros((plot_height, plot_width, 3), np.uint8)
+                plotter[:, 0:plot_width] = (250, 255, 255)
+                cv2.putText(plotter, "Please Upload A Floorplan!", (20, 480-20), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 1)
+            else:
+                plotter = cv2.resize(floorplan_image, dsize=(plot_width, plot_height), interpolation=cv2.INTER_CUBIC)
+
+            temp_total_people = 0
+            temp_total_dangerous = 0
+            scanned_coords = []
+            for worker in ai_workers.values():
+                if worker.online:
+                    cv2.polylines(
+                        plotter,
+                        [
+                            np.array(
+                                [
+                                    [
+                                        [worker.o_x1, worker.o_y1],
+                                        [worker.o_x2, worker.o_y2],
+                                        [worker.o_x3, worker.o_y3],
+                                        [worker.o_x4, worker.o_y4],
+                                    ]
+                                ]
+                            )
+                        ],
+                        True,
+                        (255, 0, 0),
+                        thickness=2,
+                    )
+
+                    for px, py in worker.points:
+                        temp_total_people += 1
+                        cv2.rectangle(
+                            plotter,
+                            (px + 5, py + 5),
+                            (px - 5, py - 5),
+                            color=(0, 0, 0),
+                            thickness=2,
+                        )
+
+                        cv2.ellipse(
+                            plotter,
+                            (px, py),
+                            (25, 25),
+                            0,
+                            0,
+                            360,
+                            (0, 165, 255),
+                            thickness=2,
+                        )
+
+            global heatmap_img
+            global total_people
+            heatmap_img = plotter
+            total_people = temp_total_people
+
+        except Exception as e:
+            print(e)
+            time.sleep(1)
+                
 
 
 @server.route("/", strict_slashes=False)
@@ -414,24 +504,41 @@ def plot_feed(worker_id):
     )
 
 
+@server.route("/heatmap.mjpg", strict_slashes=False)
+def heatmap_feed():
+    def generate_next_frame():
+        while True:
+            time.sleep(0.1)
+            ret, jpg = cv2.imencode(
+                ".jpg", heatmap_img
+            )
+            frame = jpg.tobytes()
+            yield (b"--HTN\r\n" b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+
+    return Response(
+        generate_next_frame(),
+        mimetype="multipart/x-mixed-replace; boundary=HTN",
+    )
+
+
 @server.route("/set_floorplan", methods=["POST"], strict_slashes=False)
 def set_floorplan():
     json_data = request.get_json(force=True)
     try:
-        img_link = str(json_data["img_link"])
+        img_url = str(json_data["img_url"])
     except KeyError:
         return "KeyError", 400
     except ValueError:
         return "ValueError", 400
 
-    if ".jpg" not in img_link and ".jpeg" not in img_link:
+    if ".jpg" not in img_url and ".jpeg" not in img_url:
         return "JPEG ONLY", 400
 
     print("DEBUG: Creating New Camera")
 
     # Set Image
     global floorplan_image
-    resp = urllib.urlopen(img_link)
+    resp = urllib.request.urlopen(img_url)
     image = np.asarray(bytearray(resp.read()), dtype="uint8")
     floorplan_image = cv2.imdecode(image, cv2.IMREAD_COLOR)
 
@@ -557,6 +664,11 @@ if __name__ == "__main__":
     parser.add_argument("--ip", default="0.0.0.0", help="server ip")
     parser.add_argument("--port", default="5500", help="server port")
     args = parser.parse_args()
+
+    # Start Heatmap Generator
+    heatmap_generation_thread = threading.Thread(target=generate_heatmap)
+    heatmap_generation_thread.setDaemon(True)
+    heatmap_generation_thread.start()
 
     server.run(host=args.ip, port=args.port)
 

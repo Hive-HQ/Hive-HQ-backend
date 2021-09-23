@@ -1,6 +1,8 @@
 # Hive-HQ-backend
 
-Project for Hack the North 2021.
+Project for Hack the North 2021.  
+Also available at: https://devpost.com/software/hive-hq
+
 
 ## 💡 Inspiration
 As society and public services reopen, stores and other areas are becoming crowded again. However, with the threat of COVID-19 variants and increasing case counts looming over society, it is still vital to be mindful of crowded areas. This is where Hive-HQ comes in – it is an AI-powered, multi-target tracking system that identifies common hotspots and bottlenecks where people crowd together in unsafe situations. We set out to build a tool to help businesses monitor their premises and prevent the spread of COVID-19, creating a safer world for everyone.
